@@ -72,7 +72,7 @@ class Repo {
       DateTime start, DateTime end) async {
     final rows = await db
         .from('appointments')
-        .select('*, appointment_services(*), clients(photo_path)')
+        .select('*, appointment_services(*), clients(photo_path, phone)')
         .gte('starts_at', start.toUtc().toIso8601String())
         .lt('starts_at', end.toUtc().toIso8601String())
         .neq('status', ApptStatus.cancelado)
@@ -135,6 +135,7 @@ class Repo {
     String appointmentId,
     Map<String, double> prices, {
     double? extraPrice,
+    String? paymentMethod,
   }) async {
     for (final e in prices.entries) {
       await db
@@ -148,7 +149,10 @@ class Repo {
         'price': extraPrice,
       });
     }
-    await setStatus(appointmentId, ApptStatus.concluido);
+    await db.from('appointments').update({
+      'status': ApptStatus.concluido,
+      if (paymentMethod != null) 'payment_method': paymentMethod,
+    }).eq('id', appointmentId);
   }
   // ---------------------------------------------------------------- caixa
 
@@ -385,6 +389,150 @@ class Repo {
       'p_new_password': newPassword,
     });
     return r == true;
+  }
+  // ---------------------------------------------------------------- lembretes
+
+  Future<void> markReminderSent(String appointmentId) async {
+    await db.from('appointments').update(
+        {'reminder_sent_at': DateTime.now().toUtc().toIso8601String()}).eq('id', appointmentId);
+  }
+
+  // ---------------------------------------------------------------- pagamento
+
+  Future<void> setPayment(String appointmentId, String method) async {
+    await db
+        .from('appointments')
+        .update({'payment_method': method}).eq('id', appointmentId);
+  }
+
+  /// Atendimentos concluídos do mês (com valores e forma de pagamento).
+  Future<List<Appointment>> doneInMonth(DateTime month) async {
+    final start = DateTime(month.year, month.month, 1);
+    final end = DateTime(month.year, month.month + 1, 1);
+    final rows = await db
+        .from('appointments')
+        .select('*, appointment_services(*), clients(photo_path, phone)')
+        .eq('status', ApptStatus.concluido)
+        .gte('starts_at', start.toUtc().toIso8601String())
+        .lt('starts_at', end.toUtc().toIso8601String())
+        .order('starts_at');
+    return rows.map(Appointment.fromMap).toList();
+  }
+
+  /// Tudo o que ficou para pagar depois (de qualquer mês).
+  Future<List<Appointment>> pendingPayments() async {
+    final rows = await db
+        .from('appointments')
+        .select('*, appointment_services(*), clients(photo_path, phone)')
+        .eq('status', ApptStatus.concluido)
+        .eq('payment_method', PaymentMethod.pendente)
+        .order('starts_at');
+    return rows.map(Appointment.fromMap).toList();
+  }
+
+  // ---------------------------------------------------------------- ficha da cliente
+
+  Future<ClientStats> clientStats(String clientId) async {
+    final row = await db
+        .from('client_stats')
+        .select()
+        .eq('client_id', clientId)
+        .maybeSingle();
+    return row == null ? const ClientStats() : ClientStats.fromMap(row);
+  }
+
+  Future<List<Appointment>> clientHistory(String clientId) async {
+    final rows = await db
+        .from('appointments')
+        .select('*, appointment_services(*), clients(photo_path, phone)')
+        .eq('client_id', clientId)
+        .neq('status', ApptStatus.cancelado)
+        .order('starts_at', ascending: false)
+        .limit(50);
+    return rows.map(Appointment.fromMap).toList();
+  }
+
+  /// Clientes com retorno vencido e sem nenhum horário futuro marcado.
+  Future<List<OverdueClient>> overdueClients({bool onlyRegular = true}) async {
+    var query = db.from('clients').select();
+    if (onlyRegular) query = query.eq('is_regular', true);
+    final clientRows = await query;
+    final stats = await db.from('client_stats').select();
+    final byId = {
+      for (final r in stats) r['client_id'] as String: ClientStats.fromMap(r),
+    };
+    final today = DateTime.now();
+    final list = <OverdueClient>[];
+    for (final r in clientRows) {
+      final c = Client.fromMap(r);
+      final st = byId[c.id];
+      if (st == null || st.lastVisit == null || st.nextVisit != null) continue;
+      final due = st.lastVisit!.add(Duration(days: c.intervalDays));
+      final late = today.difference(due).inDays;
+      if (late >= 0) list.add(OverdueClient(c, st.lastVisit!, late));
+    }
+    list.sort((a, b) => b.daysLate.compareTo(a.daysLate));
+    return list;
+  }
+
+  /// Foto do resultado (unhas feitas) de um atendimento.
+  Future<String> setNailPhoto(
+    String appointmentId,
+    Uint8List bytes, {
+    String mimeType = 'image/jpeg',
+    String? oldPath,
+  }) async {
+    final uid = db.auth.currentUser!.id;
+    final ext = mimeType == 'image/png'
+        ? 'png'
+        : mimeType == 'image/webp'
+            ? 'webp'
+            : 'jpg';
+    final path =
+        '$uid/nails/${appointmentId}_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    await db.storage.from(_photoBucket).uploadBinary(
+          path,
+          bytes,
+          fileOptions: FileOptions(contentType: mimeType, upsert: true),
+        );
+    await db
+        .from('appointments')
+        .update({'nail_photo_path': path}).eq('id', appointmentId);
+    if (oldPath != null && oldPath != path) {
+      _photoUrlCache.remove(oldPath);
+      try {
+        await db.storage.from(_photoBucket).remove([oldPath]);
+      } catch (_) {}
+    }
+    return path;
+  }
+
+  // ---------------------------------------------------------------- bloqueios
+
+  Future<List<Block>> blocksBetween(DateTime start, DateTime end) async {
+    try {
+      final rows = await db
+          .from('blocks')
+          .select()
+          .gte('day', _ymd.format(start))
+          .lt('day', _ymd.format(end))
+          .order('day');
+      return rows.map(Block.fromMap).toList();
+    } catch (_) {
+      return const []; // tabela ainda não criada: segue sem bloqueios
+    }
+  }
+
+  Future<void> addBlock(DateTime day, {int? hour, int? minute, String? reason}) async {
+    await db.from('blocks').insert({
+      'day': _ymd.format(day),
+      if (hour != null) 'start_time': _time(hour, minute ?? 0),
+      if (reason != null && reason.isNotEmpty) 'reason': reason,
+    });
+  }
+
+  Future<void> deleteBlock(String id) async {
+    await db.from('blocks').delete().eq('id', id);
   }
 }
 

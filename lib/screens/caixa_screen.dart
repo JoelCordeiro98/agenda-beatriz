@@ -1,9 +1,14 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
+import 'package:share_plus/share_plus.dart';
 
 import '../models.dart';
 import '../repository.dart';
 import '../util/format.dart';
+import '../util/whatsapp.dart';
 import '../widgets/expense_sheet.dart';
 
 class CaixaScreen extends StatefulWidget {
@@ -18,6 +23,8 @@ class _CaixaScreenState extends State<CaixaScreen> {
   MonthSummary _summary = const MonthSummary();
   List<WeekRevenue> _weeks = [];
   List<Expense> _expenses = [];
+  List<Appointment> _done = [];
+  List<Appointment> _pending = [];
   bool _loading = true;
   String? _error;
 
@@ -36,11 +43,21 @@ class _CaixaScreenState extends State<CaixaScreen> {
       final summary = await repo.monthSummary(_month);
       final weeks = await repo.weeksOfMonth(_month);
       final expenses = await repo.expensesOfMonth(_month);
+      var done = <Appointment>[];
+      var pending = <Appointment>[];
+      try {
+        done = await repo.doneInMonth(_month);
+        pending = await repo.pendingPayments();
+      } catch (_) {
+        // colunas novas ainda não criadas: o resto do caixa funciona
+      }
       if (!mounted) return;
       setState(() {
         _summary = summary;
         _weeks = weeks;
         _expenses = expenses;
+        _done = done;
+        _pending = pending;
         _loading = false;
       });
     } catch (_) {
@@ -114,7 +131,16 @@ class _CaixaScreenState extends State<CaixaScreen> {
     final monthTitle =
         capitalize(DateFormat("MMMM 'de' y", 'pt_BR').format(_month));
     return Scaffold(
-      appBar: AppBar(title: const Text('Caixa')),
+      appBar: AppBar(
+        title: const Text('Caixa'),
+        actions: [
+          IconButton(
+            tooltip: 'Compartilhar resumo do mês',
+            icon: const Icon(Icons.ios_share),
+            onPressed: _loading || _error != null ? null : _share,
+          ),
+        ],
+      ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () => _addExpense(),
         icon: const Icon(Icons.remove_circle_outline),
@@ -195,6 +221,63 @@ class _CaixaScreenState extends State<CaixaScreen> {
           ),
           const SizedBox(height: 20),
 
+          // ------------------------------------------------ pagamentos
+          if (_done.isNotEmpty) ...[
+            _SectionTitle('Como recebeu no mês'),
+            Card(
+              elevation: 0,
+              color: theme.colorScheme.surfaceContainerHighest,
+              child: Column(
+                children: [
+                  for (final e in _byMethod().entries)
+                    ListTile(
+                      dense: true,
+                      leading: Icon(_methodIcon(e.key)),
+                      title: Text(PaymentMethod.label(e.key)),
+                      trailing: Text(money.format(e.value),
+                          style: theme.textTheme.titleSmall),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
+
+          // ------------------------------------------------ a receber
+          if (_pending.isNotEmpty) ...[
+            _SectionTitle(
+                'A receber · ${money.format(_pending.fold(0.0, (s, a) => s + a.total))}'),
+            Card(
+              elevation: 0,
+              color: Colors.orange.shade50,
+              child: Column(
+                children: [
+                  for (final a in _pending)
+                    ListTile(
+                      title: Text(a.clientName),
+                      subtitle: Text(
+                          '${DateFormat('dd/MM').format(a.startsAt)} · ${money.format(a.total)}'),
+                      trailing: Wrap(
+                        spacing: 4,
+                        children: [
+                          IconButton(
+                            tooltip: 'Cobrar no WhatsApp',
+                            icon: const Icon(Icons.chat_outlined),
+                            onPressed: () => _charge(a),
+                          ),
+                          FilledButton.tonal(
+                            onPressed: () => _markPaid(a),
+                            child: const Text('Recebi'),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
+
           // ------------------------------------------------ despesas
           _SectionTitle('Despesas do mês'),
           if (!hasRent)
@@ -253,6 +336,208 @@ class _CaixaScreenState extends State<CaixaScreen> {
         ],
       ),
     );
+  }
+
+  // ---------------------------------------------------------------- pagamentos
+
+  Map<String, double> _byMethod() {
+    final map = <String, double>{};
+    for (final a in _done) {
+      final k = a.paymentMethod ?? '';
+      map[k] = (map[k] ?? 0) + a.total;
+    }
+    final order = [...PaymentMethod.all, ''];
+    return {
+      for (final k in order)
+        if ((map[k] ?? 0) > 0) k: map[k]!,
+    };
+  }
+
+  IconData _methodIcon(String m) => switch (m) {
+        PaymentMethod.pix => Icons.qr_code_2,
+        PaymentMethod.dinheiro => Icons.payments_outlined,
+        PaymentMethod.cartao => Icons.credit_card,
+        PaymentMethod.pendente => Icons.hourglass_bottom,
+        _ => Icons.help_outline,
+      };
+
+  void _snack(String msg) => ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(msg)));
+
+  Future<void> _markPaid(Appointment a) async {
+    final method = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('${a.clientName} pagou como?'),
+        children: [
+          for (final m in [
+            PaymentMethod.pix,
+            PaymentMethod.dinheiro,
+            PaymentMethod.cartao,
+          ])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, m),
+              child: Row(
+                children: [
+                  Icon(_methodIcon(m)),
+                  const SizedBox(width: 12),
+                  Text(PaymentMethod.label(m)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (method == null) return;
+    try {
+      await repo.setPayment(a.id, method);
+      _load();
+    } catch (_) {
+      _snack('Não foi possível salvar. Verifique a internet.');
+    }
+  }
+
+  Future<void> _charge(Appointment a) async {
+    final text = 'Oi, ${firstName(a.clientName)}! 💅 Passando para lembrar do '
+        'valor de ${money.format(a.total)} do atendimento do dia '
+        '${DateFormat('dd/MM').format(a.startsAt)}. Pode ser no Pix? Obrigada! 😊';
+    final ok = await openWhatsApp(phone: a.clientPhone, text: text);
+    if (!ok && mounted) _snack('Não consegui abrir o WhatsApp.');
+  }
+
+  // ---------------------------------------------------------------- resumo
+
+  String _monthName() =>
+      capitalize(DateFormat("MMMM 'de' y", 'pt_BR').format(_month));
+
+  String _summaryText() {
+    final s = _summary;
+    final b = StringBuffer()
+      ..writeln('💅 Resumo de ${_monthName()}')
+      ..writeln('')
+      ..writeln('Atendimentos: ${s.atendimentos}')
+      ..writeln('Faturamento: ${money.format(s.faturamento)}')
+      ..writeln('Despesas: ${money.format(s.despesas)}');
+    if (s.aluguel > 0) b.writeln('  • Aluguel da mesa: ${money.format(s.aluguel)}');
+    if (s.material > 0) b.writeln('  • Material: ${money.format(s.material)}');
+    if (s.outros > 0) b.writeln('  • Outros: ${money.format(s.outros)}');
+    b
+      ..writeln('Lucro: ${money.format(s.lucro)}')
+      ..writeln('');
+    final methods = _byMethod();
+    if (methods.isNotEmpty) {
+      b.writeln('Como recebeu:');
+      for (final e in methods.entries) {
+        b.writeln('  • ${PaymentMethod.label(e.key)}: ${money.format(e.value)}');
+      }
+      b.writeln('');
+    }
+    final weeks = _allWeeks().where((w) => w.faturamento > 0);
+    if (weeks.isNotEmpty) {
+      b.writeln('Por semana:');
+      final f = DateFormat('dd/MM');
+      for (final w in weeks) {
+        final sat = DateTime(w.weekStart.year, w.weekStart.month, w.weekStart.day + 5);
+        b.writeln('  • ${f.format(w.weekStart)} a ${f.format(sat)}: ${money.format(w.faturamento)}');
+      }
+    }
+    return b.toString().trimRight();
+  }
+
+  String _csvMoney(double v) => v.toStringAsFixed(2).replaceAll('.', ',');
+
+  String _csvCell(String v) {
+    const q = '"';
+    if (!v.contains(';') && !v.contains(q) && !v.contains('\n')) return v;
+    final escaped = v.replaceAll(q, q + q);
+    return q + escaped + q;
+  }
+
+  String _csv() {
+    final f = DateFormat('dd/MM/yyyy');
+    final rows = <List<String>>[
+      ['Atendimentos de ${_monthName()}'],
+      ['Data', 'Hora', 'Cliente', 'Serviços', 'Valor', 'Pagamento'],
+      for (final a in _done)
+        [
+          f.format(a.startsAt),
+          timeLabel(a.startsAt),
+          a.clientName,
+          a.servicesLabel,
+          _csvMoney(a.total),
+          PaymentMethod.label(a.paymentMethod),
+        ],
+      [],
+      ['Despesas'],
+      ['Data', 'Categoria', 'Descrição', 'Valor'],
+      for (final e in _expenses)
+        [
+          f.format(e.spentOn),
+          ExpenseCategory.label(e.category),
+          e.description ?? '',
+          _csvMoney(e.amount),
+        ],
+      [],
+      ['Resumo'],
+      ['Faturamento', _csvMoney(_summary.faturamento)],
+      ['Despesas', _csvMoney(_summary.despesas)],
+      ['Lucro', _csvMoney(_summary.lucro)],
+    ];
+    return rows.map((r) => r.map(_csvCell).join(';')).join('\r\n');
+  }
+
+  Future<void> _share() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.chat_outlined),
+              title: const Text('Enviar resumo pelo WhatsApp'),
+              onTap: () => Navigator.pop(ctx, 'whatsapp'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: const Text('Copiar resumo'),
+              onTap: () => Navigator.pop(ctx, 'copy'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.table_chart_outlined),
+              title: const Text('Planilha do mês (Excel)'),
+              subtitle: const Text('Atendimentos e despesas, para guardar'),
+              onTap: () => Navigator.pop(ctx, 'csv'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    switch (choice) {
+      case 'whatsapp':
+        final ok = await openWhatsApp(text: _summaryText());
+        if (!ok) _snack('Não consegui abrir o WhatsApp. Use "Copiar resumo".');
+      case 'copy':
+        await Clipboard.setData(ClipboardData(text: _summaryText()));
+        _snack('Resumo copiado');
+      case 'csv':
+        final name =
+            'caixa-${DateFormat('yyyy-MM').format(_month)}.csv';
+        final bytes = utf8.encode('\uFEFF${_csv()}');
+        try {
+          await Share.shareXFiles(
+            [XFile.fromData(bytes, name: name, mimeType: 'text/csv')],
+            fileNameOverrides: [name],
+            subject: 'Caixa de ${_monthName()}',
+          );
+        } catch (_) {
+          await Clipboard.setData(ClipboardData(text: _csv()));
+          _snack('Não deu para gerar o arquivo aqui; a planilha foi copiada como texto.');
+        }
+    }
   }
 
   IconData _expenseIcon(String c) => switch (c) {

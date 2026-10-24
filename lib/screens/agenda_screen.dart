@@ -8,9 +8,14 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models.dart';
 import '../repository.dart';
 import '../util/format.dart';
+import '../util/photo_picker.dart';
+import '../util/whatsapp.dart';
 import '../widgets/finish_sheet.dart';
 import '../widgets/client_avatar.dart';
 import '../widgets/new_appointment_sheet.dart';
+import 'client_detail_screen.dart';
+import 'overdue_screen.dart';
+import 'reminders_screen.dart';
 
 class AgendaScreen extends StatefulWidget {
   const AgendaScreen({super.key});
@@ -19,11 +24,12 @@ class AgendaScreen extends StatefulWidget {
   State<AgendaScreen> createState() => _AgendaScreenState();
 }
 
-/// Uma linha da agenda: um horário, livre ou ocupado.
+/// Uma linha da agenda: um horário livre, ocupado ou bloqueado.
 class _Entry {
   final DateTime time;
   final Appointment? appt;
-  const _Entry(this.time, this.appt);
+  final Block? block;
+  const _Entry(this.time, this.appt, [this.block]);
 }
 
 class _AgendaScreenState extends State<AgendaScreen> {
@@ -32,6 +38,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
   List<Service> _services = [];
   List<Appointment> _appts = [];
   Map<String, String> _photos = {};
+  List<Block> _blocks = [];
   bool _loading = true;
   bool _setupDone = false;
   String? _error;
@@ -61,10 +68,13 @@ class _AgendaScreenState extends State<AgendaScreen> {
         DateTime(_day.year, _day.month, _day.day + 1),
       );
       final photos = await repo.photoUrls(appts.map((a) => a.clientPhotoPath));
+      final blocks = await repo.blocksBetween(
+          _day, DateTime(_day.year, _day.month, _day.day + 1));
       if (!mounted) return;
       setState(() {
         _appts = appts;
         _photos = photos;
+        _blocks = blocks;
         _loading = false;
       });
     } catch (e) {
@@ -81,9 +91,24 @@ class _AgendaScreenState extends State<AgendaScreen> {
     _load();
   }
 
+  Block? get _dayBlock {
+    for (final b in _blocks) {
+      if (b.wholeDay) return b;
+    }
+    return null;
+  }
+
+  Block? _slotBlock(int hour, int minute) {
+    for (final b in _blocks) {
+      if (!b.wholeDay && b.hour == hour && b.minute == minute) return b;
+    }
+    return null;
+  }
+
   List<_Entry> _entries() {
     final used = <String>{};
     final list = <_Entry>[];
+    final dayBlocked = _dayBlock != null;
 
     for (final s in _slots.where((s) => s.weekday == _day.weekday)) {
       final t = DateTime(_day.year, _day.month, _day.day, s.hour, s.minute);
@@ -97,7 +122,8 @@ class _AgendaScreenState extends State<AgendaScreen> {
         }
       }
       if (match != null) used.add(match.id);
-      list.add(_Entry(t, match));
+      if (match == null && dayBlocked) continue; // dia bloqueado: some com os livres
+      list.add(_Entry(t, match, match == null ? _slotBlock(s.hour, s.minute) : null));
     }
 
     // Encaixes fora dos horários fixos
@@ -241,6 +267,194 @@ class _AgendaScreenState extends State<AgendaScreen> {
     if (ok == true) await _setStatus(a, ApptStatus.cancelado);
   }
 
+  // ---------------------------------------------------------------- bloqueios
+
+  Future<String?> _askReason(String title) async {
+    final c = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          textCapitalization: TextCapitalization.sentences,
+          decoration: const InputDecoration(
+            labelText: 'Motivo (opcional)',
+            hintText: 'Ex.: feriado, médico, viagem',
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Bloquear')),
+        ],
+      ),
+    );
+    final text = c.text.trim();
+    c.dispose();
+    return ok == true ? text : null;
+  }
+
+  Future<void> _blockDay() async {
+    final reason = await _askReason('Bloquear ${dayTitle(_day).toLowerCase()}?');
+    if (reason == null) return;
+    try {
+      await repo.addBlock(_day, reason: reason);
+      _load();
+    } catch (_) {
+      _snack('Não foi possível bloquear. Rode o features.sql no Supabase.');
+    }
+  }
+
+  Future<void> _blockSlot(DateTime t) async {
+    final reason = await _askReason('Bloquear ${timeLabel(t)}?');
+    if (reason == null) return;
+    try {
+      await repo.addBlock(_day, hour: t.hour, minute: t.minute, reason: reason);
+      _load();
+    } catch (_) {
+      _snack('Não foi possível bloquear. Rode o features.sql no Supabase.');
+    }
+  }
+
+  Future<void> _unblock(Block b) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(b.wholeDay ? 'Desbloquear o dia?' : 'Desbloquear o horário?'),
+        content: b.reason == null ? null : Text('Motivo: ${b.reason}'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Voltar')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Desbloquear')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await repo.deleteBlock(b.id);
+      _load();
+    } catch (_) {
+      _snack('Não foi possível salvar. Verifique a internet.');
+    }
+  }
+
+  Future<void> _blockMenu() async {
+    if (_dayBlock != null) {
+      await _unblock(_dayBlock!);
+      return;
+    }
+    final free = _entries().where((e) => e.appt == null && e.block == null).toList();
+    final choice = await showModalBottomSheet<Object>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Text(dayTitle(_day), style: Theme.of(ctx).textTheme.titleMedium),
+              const SizedBox(height: 12),
+              FilledButton.tonalIcon(
+                onPressed: () => Navigator.pop(ctx, 'day'),
+                icon: const Icon(Icons.block),
+                label: const Text('Bloquear o dia inteiro'),
+              ),
+              if (free.isNotEmpty) ...[
+                const SizedBox(height: 16),
+                const Text('Ou só um horário:'),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    for (final e in free)
+                      ActionChip(
+                        label: Text(hourLabel(e.time.hour, e.time.minute)),
+                        onPressed: () => Navigator.pop(ctx, e.time),
+                      ),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (choice == 'day') await _blockDay();
+    if (choice is DateTime) await _blockSlot(choice);
+  }
+
+  // ---------------------------------------------------------------- atalhos
+
+  Future<void> _openPage(Widget page) async {
+    await Navigator.of(context).push(MaterialPageRoute(builder: (_) => page));
+    if (mounted) _load();
+  }
+
+  Future<void> _remind(Appointment a) async {
+    final ok = await openWhatsApp(
+        phone: a.clientPhone, text: reminderMessage(a, today: DateTime.now()));
+    if (!ok) {
+      _snack('Não consegui abrir o WhatsApp.');
+      return;
+    }
+    try {
+      await repo.markReminderSent(a.id);
+    } catch (_) {}
+    _load();
+  }
+
+  Future<void> _nailPhoto(Appointment a) async {
+    try {
+      final p = await pickPhoto(context);
+      if (p == null) return;
+      await repo.setNailPhoto(a.id, p.bytes,
+          mimeType: p.mimeType, oldPath: a.nailPhotoPath);
+      _snack('Foto salva na ficha da cliente');
+      _load();
+    } catch (_) {
+      _snack('Não foi possível salvar a foto.');
+    }
+  }
+
+  Future<void> _received(Appointment a) async {
+    final method = await showDialog<String>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text('${a.clientName} pagou como?'),
+        children: [
+          for (final m in [
+            PaymentMethod.pix,
+            PaymentMethod.dinheiro,
+            PaymentMethod.cartao,
+          ])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, m),
+              child: Text(PaymentMethod.label(m)),
+            ),
+        ],
+      ),
+    );
+    if (method == null) return;
+    try {
+      await repo.setPayment(a.id, method);
+      _load();
+    } catch (_) {
+      _snack('Não foi possível salvar. Verifique a internet.');
+    }
+  }
+
   String? _photoOf(Appointment a) =>
       a.clientPhotoPath == null ? null : _photos[a.clientPhotoPath];
 
@@ -272,6 +486,34 @@ class _AgendaScreenState extends State<AgendaScreen> {
                 leading: const Icon(Icons.check_circle_outline),
                 title: const Text('Concluir e lançar valor'),
                 onTap: () => Navigator.pop(ctx, 'finish'),
+              ),
+            if (a.status == ApptStatus.agendado)
+              ListTile(
+                leading: const Icon(Icons.notifications_active_outlined),
+                title: Text(a.reminderSentAt == null
+                    ? 'Enviar lembrete no WhatsApp'
+                    : 'Reenviar lembrete (já enviado)'),
+                onTap: () => Navigator.pop(ctx, 'remind'),
+              ),
+            if (a.status == ApptStatus.concluido && a.isPending)
+              ListTile(
+                leading: const Icon(Icons.payments_outlined),
+                title: const Text('Recebi o pagamento'),
+                onTap: () => Navigator.pop(ctx, 'paid'),
+              ),
+            if (a.status == ApptStatus.concluido)
+              ListTile(
+                leading: const Icon(Icons.add_a_photo_outlined),
+                title: Text(a.nailPhotoPath == null
+                    ? 'Foto das unhas'
+                    : 'Trocar foto das unhas'),
+                onTap: () => Navigator.pop(ctx, 'nails'),
+              ),
+            if (a.clientId != null)
+              ListTile(
+                leading: const Icon(Icons.badge_outlined),
+                title: const Text('Ver ficha da cliente'),
+                onTap: () => Navigator.pop(ctx, 'client'),
               ),
             if (a.status == ApptStatus.concluido)
               ListTile(
@@ -318,6 +560,14 @@ class _AgendaScreenState extends State<AgendaScreen> {
         await _setStatus(a, ApptStatus.agendado);
       case 'cancel':
         await _cancel(a);
+      case 'remind':
+        await _remind(a);
+      case 'paid':
+        await _received(a);
+      case 'nails':
+        await _nailPhoto(a);
+      case 'client':
+        await _openPage(ClientDetailScreen(clientId: a.clientId!));
     }
   }
 
@@ -329,7 +579,9 @@ class _AgendaScreenState extends State<AgendaScreen> {
         monday,
         DateTime(monday.year, monday.month, monday.day + 7),
       );
-      text = freeSlotsText(monday, _slots, appts, DateTime.now());
+      final weekEnd = DateTime(monday.year, monday.month, monday.day + 7);
+      final blocks = await repo.blocksBetween(monday, weekEnd);
+      text = freeSlotsText(monday, _slots, appts, DateTime.now(), blocks: blocks);
     } catch (_) {
       _snack('Sem conexão. Tente de novo.');
       return;
@@ -388,16 +640,54 @@ class _AgendaScreenState extends State<AgendaScreen> {
                 onPressed: () => _goTo(DateTime.now()),
                 child: const Text('Hoje')),
           IconButton(
+            tooltip: 'Lembretes de amanhã',
+            icon: const Icon(Icons.notifications_active_outlined),
+            onPressed: () => _openPage(const RemindersScreen()),
+          ),
+          IconButton(
             tooltip: 'Enviar horários livres da semana',
             icon: const Icon(Icons.share_outlined),
             onPressed: _setupDone ? _shareFreeSlots : null,
           ),
           PopupMenuButton<String>(
             onSelected: (v) {
-              if (v == 'logout') Supabase.instance.client.auth.signOut();
+              switch (v) {
+                case 'overdue':
+                  _openPage(const OverdueScreen());
+                case 'block':
+                  _blockMenu();
+                case 'logout':
+                  Supabase.instance.client.auth.signOut();
+              }
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'logout', child: Text('Sair')),
+            itemBuilder: (_) => [
+              const PopupMenuItem(
+                value: 'overdue',
+                child: ListTile(
+                  leading: Icon(Icons.person_search_outlined),
+                  title: Text('Clientes sumidas'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              PopupMenuItem(
+                value: 'block',
+                enabled: _setupDone,
+                child: ListTile(
+                  leading: const Icon(Icons.block),
+                  title: Text(_dayBlock == null
+                      ? 'Bloquear dia ou horário'
+                      : 'Desbloquear este dia'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const PopupMenuItem(
+                value: 'logout',
+                child: ListTile(
+                  leading: Icon(Icons.logout),
+                  title: Text('Sair'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
             ],
           ),
         ],
@@ -450,30 +740,52 @@ class _AgendaScreenState extends State<AgendaScreen> {
     }
 
     final entries = _entries();
-    if (entries.isEmpty) {
+    final dayBlock = _dayBlock;
+    if (entries.isEmpty && dayBlock == null) {
       return const Center(child: Text('Dia de folga 🌿'));
     }
 
     return RefreshIndicator(
       onRefresh: _load,
-      child: ListView.separated(
+      child: ListView(
         padding: const EdgeInsets.fromLTRB(12, 8, 12, 96),
-        itemCount: entries.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 8),
-        itemBuilder: (_, i) {
-          final e = entries[i];
-          final appt = e.appt;
-          return appt == null
-              ? _FreeSlotTile(
-                  time: e.time,
-                  onTap: () => _newAppointment(at: e.time),
-                )
-              : _AppointmentTile(
-                  appt: appt,
-                  photoUrl: _photoOf(appt),
-                  onTap: () => _openActions(appt),
-                );
-        },
+        children: [
+          if (dayBlock != null)
+            Card(
+              elevation: 0,
+              color: Theme.of(context).colorScheme.errorContainer,
+              child: ListTile(
+                leading: const Icon(Icons.block),
+                title: const Text('Dia bloqueado'),
+                subtitle: dayBlock.reason == null ? null : Text(dayBlock.reason!),
+                trailing: TextButton(
+                  onPressed: () => _unblock(dayBlock),
+                  child: const Text('Desbloquear'),
+                ),
+              ),
+            ),
+          for (final e in entries) ...[
+            const SizedBox(height: 8),
+            if (e.appt != null)
+              _AppointmentTile(
+                appt: e.appt!,
+                photoUrl: _photoOf(e.appt!),
+                onTap: () => _openActions(e.appt!),
+              )
+            else if (e.block != null)
+              _BlockedTile(
+                time: e.time,
+                reason: e.block!.reason,
+                onTap: () => _unblock(e.block!),
+              )
+            else
+              _FreeSlotTile(
+                time: e.time,
+                onTap: () => _newAppointment(at: e.time),
+                onLongPress: () => _blockSlot(e.time),
+              ),
+          ],
+        ],
       ),
     );
   }
@@ -518,7 +830,12 @@ class _DayHeader extends StatelessWidget {
 class _FreeSlotTile extends StatelessWidget {
   final DateTime time;
   final VoidCallback onTap;
-  const _FreeSlotTile({required this.time, required this.onTap});
+  final VoidCallback? onLongPress;
+  const _FreeSlotTile({
+    required this.time,
+    required this.onTap,
+    this.onLongPress,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -533,6 +850,7 @@ class _FreeSlotTile extends StatelessWidget {
       ),
       child: ListTile(
         onTap: onTap,
+        onLongPress: onLongPress,
         leading: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -563,6 +881,8 @@ class _AppointmentTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final (label, bg, fg) = switch (appt.status) {
+      ApptStatus.concluido when appt.isPending =>
+        ('A receber', Colors.orange.shade100, Colors.orange.shade900),
       ApptStatus.concluido => ('Concluído', Colors.green.shade100, Colors.green.shade900),
       ApptStatus.faltou => ('Faltou', Colors.orange.shade100, Colors.orange.shade900),
       _ => ('Agendado', scheme.primaryContainer, scheme.onPrimaryContainer),
@@ -595,6 +915,39 @@ class _AppointmentTile extends StatelessWidget {
               color: bg, borderRadius: BorderRadius.circular(20)),
           child: Text(label, style: TextStyle(color: fg, fontSize: 12)),
         ),
+      ),
+    );
+  }
+}
+
+class _BlockedTile extends StatelessWidget {
+  final DateTime time;
+  final String? reason;
+  final VoidCallback onTap;
+  const _BlockedTile({required this.time, required this.onTap, this.reason});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Card(
+      elevation: 0,
+      color: scheme.surfaceContainerHigh,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: ListTile(
+        onTap: onTap,
+        leading: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _TimeText(time, color: scheme.onSurfaceVariant),
+            SizedBox(
+              width: 40,
+              child: Icon(Icons.block, color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+        title: Text('Bloqueado',
+            style: TextStyle(color: scheme.onSurfaceVariant)),
+        subtitle: Text(reason ?? 'Toque para desbloquear'),
       ),
     );
   }

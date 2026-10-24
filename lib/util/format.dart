@@ -43,8 +43,9 @@ String freeSlotsText(
   DateTime monday,
   List<WorkSlot> slots,
   List<Appointment> appts,
-  DateTime now,
-) {
+  DateTime now, {
+  List<Block> blocks = const [],
+}) {
   final lines = <String>[];
   for (var i = 0; i < 7; i++) {
     final day = DateTime(monday.year, monday.month, monday.day + i);
@@ -52,6 +53,10 @@ String freeSlotsText(
     for (final s in slots.where((s) => s.weekday == day.weekday)) {
       final t = DateTime(day.year, day.month, day.day, s.hour, s.minute);
       if (!t.isAfter(now)) continue;
+      final blocked = blocks.any((b) =>
+          sameDay(b.day, day) &&
+          (b.wholeDay || (b.hour == s.hour && b.minute == s.minute)));
+      if (blocked) continue;
       final taken = appts.any((a) =>
           sameDay(a.startsAt, t) &&
           a.startsAt.hour == s.hour &&

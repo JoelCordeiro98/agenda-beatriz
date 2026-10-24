@@ -106,6 +106,10 @@ class Appointment {
   final String? notes;
   final List<ApptItem> items;
   final String? clientPhotoPath;
+  final String? clientPhone;
+  final String? paymentMethod;
+  final DateTime? reminderSentAt;
+  final String? nailPhotoPath;
 
   const Appointment({
     required this.id,
@@ -116,7 +120,13 @@ class Appointment {
     this.notes,
     this.items = const [],
     this.clientPhotoPath,
+    this.clientPhone,
+    this.paymentMethod,
+    this.reminderSentAt,
+    this.nailPhotoPath,
   });
+
+  bool get isPending => paymentMethod == PaymentMethod.pendente;
 
   double get total => items.fold(0.0, (sum, i) => sum + i.price);
 
@@ -137,6 +147,12 @@ class Appointment {
           .toList(),
       clientPhotoPath:
           client is Map ? client['photo_path'] as String? : null,
+      clientPhone: client is Map ? client['phone'] as String? : null,
+      paymentMethod: m['payment_method'] as String?,
+      reminderSentAt: m['reminder_sent_at'] == null
+          ? null
+          : DateTime.parse(m['reminder_sent_at'] as String).toLocal(),
+      nailPhotoPath: m['nail_photo_path'] as String?,
     );
   }
 }
@@ -233,4 +249,93 @@ class Expense {
         amount: _toDouble(m['amount']),
         spentOn: DateTime.parse(m['spent_on'] as String),
       );
+}
+
+// ------------------------------------------------------------------ pagamento
+
+class PaymentMethod {
+  static const pix = 'pix';
+  static const dinheiro = 'dinheiro';
+  static const cartao = 'cartao';
+  static const pendente = 'pendente';
+
+  static const all = [pix, dinheiro, cartao, pendente];
+
+  static String label(String? m) => switch (m) {
+        pix => 'Pix',
+        dinheiro => 'Dinheiro',
+        cartao => 'Cartão',
+        pendente => 'Pagou depois',
+        _ => 'Não informado',
+      };
+}
+
+// ------------------------------------------------------------------ bloqueios
+
+class Block {
+  final String id;
+  final DateTime day;
+  final int? hour; // null = dia inteiro
+  final int? minute;
+  final String? reason;
+
+  const Block({
+    required this.id,
+    required this.day,
+    this.hour,
+    this.minute,
+    this.reason,
+  });
+
+  bool get wholeDay => hour == null;
+
+  factory Block.fromMap(Map<String, dynamic> m) {
+    final t = m['start_time'] as String?;
+    final parts = t?.split(':');
+    return Block(
+      id: m['id'] as String,
+      day: DateTime.parse(m['day'] as String),
+      hour: parts == null ? null : int.parse(parts[0]),
+      minute: parts == null ? null : int.parse(parts[1]),
+      reason: m['reason'] as String?,
+    );
+  }
+}
+
+// ------------------------------------------------------------------ estatísticas
+
+class ClientStats {
+  final DateTime? lastVisit;
+  final DateTime? nextVisit;
+  final int visits;
+  final int noShows;
+  final double totalSpent;
+
+  const ClientStats({
+    this.lastVisit,
+    this.nextVisit,
+    this.visits = 0,
+    this.noShows = 0,
+    this.totalSpent = 0,
+  });
+
+  factory ClientStats.fromMap(Map<String, dynamic> m) => ClientStats(
+        lastVisit: m['last_visit'] == null
+            ? null
+            : DateTime.parse(m['last_visit'] as String).toLocal(),
+        nextVisit: m['next_visit'] == null
+            ? null
+            : DateTime.parse(m['next_visit'] as String).toLocal(),
+        visits: _toInt(m['visits']),
+        noShows: _toInt(m['no_shows']),
+        totalSpent: _toDouble(m['total_spent']),
+      );
+}
+
+/// Cliente com retorno atrasado.
+class OverdueClient {
+  final Client client;
+  final DateTime lastVisit;
+  final int daysLate;
+  const OverdueClient(this.client, this.lastVisit, this.daysLate);
 }

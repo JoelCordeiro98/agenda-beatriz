@@ -15,6 +15,7 @@ dependencies:
   intl: any
   url_launcher: ^6.3.0
   image_picker: ^1.1.2
+  share_plus: ^10.1.4
 
 dev_dependencies:
   flutter_lints: ^5.0.0

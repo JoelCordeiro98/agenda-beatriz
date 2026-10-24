@@ -7,6 +7,19 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models.dart';
 import '../repository.dart';
 import '../widgets/client_avatar.dart';
+import 'client_detail_screen.dart';
+
+/// Abre o formulário da cliente (nova ou existente). Devolve true se salvou.
+Future<bool?> showClientSheet(BuildContext context,
+    {Client? client, String? photoUrl}) {
+  return showModalBottomSheet<bool>(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    showDragHandle: true,
+    builder: (_) => _ClientSheet(client: client, photoUrl: photoUrl),
+  );
+}
 
 class ClientsScreen extends StatefulWidget {
   const ClientsScreen({super.key});
@@ -71,17 +84,19 @@ class _ClientsScreenState extends State<ClientsScreen> {
   }
 
   Future<void> _edit([Client? c]) async {
-    final saved = await showModalBottomSheet<bool>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      showDragHandle: true,
-      builder: (_) => _ClientSheet(
-        client: c,
-        photoUrl: c?.photoPath == null ? null : _photos[c!.photoPath],
-      ),
+    final saved = await showClientSheet(
+      context,
+      client: c,
+      photoUrl: c?.photoPath == null ? null : _photos[c!.photoPath],
     );
     if (saved == true) _load();
+  }
+
+  Future<void> _openDetail(Client c) async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => ClientDetailScreen(clientId: c.id)),
+    );
+    if (changed == true) _load();
   }
 
   @override
@@ -156,7 +171,7 @@ class _ClientsScreenState extends State<ClientsScreen> {
                                     ],
                                   ),
                                   subtitle: Text(details),
-                                  onTap: () => _edit(c),
+                                  onTap: () => _openDetail(c),
                                   trailing: _waNumber(c.phone) == null
                                       ? null
                                       : IconButton(
