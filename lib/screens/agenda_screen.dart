@@ -9,6 +9,7 @@ import '../models.dart';
 import '../repository.dart';
 import '../util/format.dart';
 import '../widgets/finish_sheet.dart';
+import '../widgets/client_avatar.dart';
 import '../widgets/new_appointment_sheet.dart';
 
 class AgendaScreen extends StatefulWidget {
@@ -30,6 +31,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
   List<WorkSlot> _slots = [];
   List<Service> _services = [];
   List<Appointment> _appts = [];
+  Map<String, String> _photos = {};
   bool _loading = true;
   bool _setupDone = false;
   String? _error;
@@ -58,9 +60,11 @@ class _AgendaScreenState extends State<AgendaScreen> {
         _day,
         DateTime(_day.year, _day.month, _day.day + 1),
       );
+      final photos = await repo.photoUrls(appts.map((a) => a.clientPhotoPath));
       if (!mounted) return;
       setState(() {
         _appts = appts;
+        _photos = photos;
         _loading = false;
       });
     } catch (e) {
@@ -237,6 +241,9 @@ class _AgendaScreenState extends State<AgendaScreen> {
     if (ok == true) await _setStatus(a, ApptStatus.cancelado);
   }
 
+  String? _photoOf(Appointment a) =>
+      a.clientPhotoPath == null ? null : _photos[a.clientPhotoPath];
+
   Future<void> _openActions(Appointment a) async {
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -246,6 +253,11 @@ class _AgendaScreenState extends State<AgendaScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             ListTile(
+              leading: ClientAvatar(
+                name: a.clientName,
+                photoUrl: _photoOf(a),
+                radius: 28,
+              ),
               title: Text(a.clientName,
                   style: Theme.of(ctx).textTheme.titleMedium),
               subtitle: Text([
@@ -456,7 +468,11 @@ class _AgendaScreenState extends State<AgendaScreen> {
                   time: e.time,
                   onTap: () => _newAppointment(at: e.time),
                 )
-              : _AppointmentTile(appt: appt, onTap: () => _openActions(appt));
+              : _AppointmentTile(
+                  appt: appt,
+                  photoUrl: _photoOf(appt),
+                  onTap: () => _openActions(appt),
+                );
         },
       ),
     );
@@ -517,7 +533,13 @@ class _FreeSlotTile extends StatelessWidget {
       ),
       child: ListTile(
         onTap: onTap,
-        leading: _TimeText(time, color: scheme.onSurfaceVariant),
+        leading: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _TimeText(time, color: scheme.onSurfaceVariant),
+            const SizedBox(width: 40),
+          ],
+        ),
         title: Text('Livre',
             style: TextStyle(color: scheme.onSurfaceVariant)),
         subtitle: past ? null : const Text('Toque para agendar'),
@@ -529,8 +551,13 @@ class _FreeSlotTile extends StatelessWidget {
 
 class _AppointmentTile extends StatelessWidget {
   final Appointment appt;
+  final String? photoUrl;
   final VoidCallback onTap;
-  const _AppointmentTile({required this.appt, required this.onTap});
+  const _AppointmentTile({
+    required this.appt,
+    required this.onTap,
+    this.photoUrl,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -552,7 +579,13 @@ class _AppointmentTile extends StatelessWidget {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: ListTile(
         onTap: onTap,
-        leading: _TimeText(appt.startsAt, color: scheme.primary),
+        leading: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _TimeText(appt.startsAt, color: scheme.primary),
+            ClientAvatar(name: appt.clientName, photoUrl: photoUrl),
+          ],
+        ),
         title: Text(appt.clientName,
             style: const TextStyle(fontWeight: FontWeight.w600)),
         subtitle: details.isEmpty ? null : Text(details),

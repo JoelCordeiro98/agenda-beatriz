@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -70,7 +72,7 @@ class Repo {
       DateTime start, DateTime end) async {
     final rows = await db
         .from('appointments')
-        .select('*, appointment_services(*)')
+        .select('*, appointment_services(*), clients(photo_path)')
         .gte('starts_at', start.toUtc().toIso8601String())
         .lt('starts_at', end.toUtc().toIso8601String())
         .neq('status', ApptStatus.cancelado)
@@ -262,7 +264,8 @@ class Repo {
     if (rows.isNotEmpty) await db.from('work_slots').insert(rows);
   }
 
-  Future<void> saveClient({
+  /// Salva a cliente e devolve o id dela.
+  Future<String> saveClient({
     String? id,
     required String name,
     String? phone,
@@ -278,12 +281,86 @@ class Repo {
       'notes': (notes == null || notes.isEmpty) ? null : notes,
     };
     if (id == null) {
-      await db.from('clients').insert(data);
-    } else {
-      await db.from('clients').update(data).eq('id', id);
-      // mantém o nome igual nos agendamentos dela
-      await db.from('appointments').update({'client_name': name}).eq('client_id', id);
+      final row = await db.from('clients').insert(data).select('id').single();
+      return row['id'] as String;
     }
+    await db.from('clients').update(data).eq('id', id);
+    // mantém o nome igual nos agendamentos dela
+    await db.from('appointments').update({'client_name': name}).eq('client_id', id);
+    return id;
+  }
+
+  // ---------------------------------------------------------------- fotos
+
+  static const _photoBucket = 'client-photos';
+  final Map<String, (String, DateTime)> _photoUrlCache = {};
+
+  /// Envia a foto, grava na cliente e apaga a anterior. Devolve o novo caminho.
+  Future<String> setClientPhoto(
+    String clientId,
+    Uint8List bytes, {
+    String mimeType = 'image/jpeg',
+    String? oldPath,
+  }) async {
+    final uid = db.auth.currentUser!.id;
+    final ext = switch (mimeType) {
+      'image/png' => 'png',
+      'image/webp' => 'webp',
+      _ => 'jpg',
+    };
+    final path = '$uid/${clientId}_${DateTime.now().millisecondsSinceEpoch}.$ext';
+    await db.storage.from(_photoBucket).uploadBinary(
+          path,
+          bytes,
+          fileOptions: FileOptions(contentType: mimeType, upsert: true),
+        );
+    await db.from('clients').update({'photo_path': path}).eq('id', clientId);
+    if (oldPath != null && oldPath != path) {
+      _photoUrlCache.remove(oldPath);
+      try {
+        await db.storage.from(_photoBucket).remove([oldPath]);
+      } catch (_) {}
+    }
+    return path;
+  }
+
+  Future<void> removeClientPhoto(String clientId, String oldPath) async {
+    await db.from('clients').update({'photo_path': null}).eq('id', clientId);
+    _photoUrlCache.remove(oldPath);
+    try {
+      await db.storage.from(_photoBucket).remove([oldPath]);
+    } catch (_) {}
+  }
+
+  /// Links temporários (o bucket é privado) para mostrar as fotos.
+  Future<Map<String, String>> photoUrls(Iterable<String?> paths) async {
+    final now = DateTime.now();
+    final wanted = paths.whereType<String>().toSet();
+    final result = <String, String>{};
+    final missing = <String>[];
+    for (final p in wanted) {
+      final cached = _photoUrlCache[p];
+      if (cached != null && cached.$2.isAfter(now)) {
+        result[p] = cached.$1;
+      } else {
+        missing.add(p);
+      }
+    }
+    if (missing.isNotEmpty) {
+      try {
+        final signed =
+            await db.storage.from(_photoBucket).createSignedUrls(missing, 3600);
+        for (final s in signed) {
+          if (s.signedUrl.isEmpty) continue;
+          result[s.path] = s.signedUrl;
+          _photoUrlCache[s.path] =
+              (s.signedUrl, now.add(const Duration(minutes: 50)));
+        }
+      } catch (_) {
+        // sem foto não impede a agenda de abrir
+      }
+    }
+    return result;
   }
   // ---------------------------------------------------------------- recuperação
 

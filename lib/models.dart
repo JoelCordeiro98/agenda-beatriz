@@ -5,6 +5,7 @@ class Client {
   final int intervalDays;
   final bool isRegular;
   final String? notes;
+  final String? photoPath;
 
   const Client({
     required this.id,
@@ -13,6 +14,7 @@ class Client {
     this.intervalDays = 30,
     this.isRegular = false,
     this.notes,
+    this.photoPath,
   });
 
   factory Client.fromMap(Map<String, dynamic> m) => Client(
@@ -22,6 +24,7 @@ class Client {
         intervalDays: (m['maintenance_interval_days'] as int?) ?? 30,
         isRegular: (m['is_regular'] as bool?) ?? false,
         notes: m['notes'] as String?,
+        photoPath: m['photo_path'] as String?,
       );
 }
 
@@ -102,6 +105,7 @@ class Appointment {
   final String status;
   final String? notes;
   final List<ApptItem> items;
+  final String? clientPhotoPath;
 
   const Appointment({
     required this.id,
@@ -111,6 +115,7 @@ class Appointment {
     required this.status,
     this.notes,
     this.items = const [],
+    this.clientPhotoPath,
   });
 
   double get total => items.fold(0.0, (sum, i) => sum + i.price);
@@ -119,6 +124,7 @@ class Appointment {
 
   factory Appointment.fromMap(Map<String, dynamic> m) {
     final rawItems = (m['appointment_services'] as List?) ?? const [];
+    final client = m['clients'];
     return Appointment(
       id: m['id'] as String,
       clientId: m['client_id'] as String?,
@@ -129,6 +135,8 @@ class Appointment {
       items: rawItems
           .map((e) => ApptItem.fromMap(e as Map<String, dynamic>))
           .toList(),
+      clientPhotoPath:
+          client is Map ? client['photo_path'] as String? : null,
     );
   }
 }

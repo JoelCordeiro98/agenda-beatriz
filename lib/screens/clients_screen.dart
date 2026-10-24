@@ -1,8 +1,12 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models.dart';
 import '../repository.dart';
+import '../widgets/client_avatar.dart';
 
 class ClientsScreen extends StatefulWidget {
   const ClientsScreen({super.key});
@@ -13,6 +17,7 @@ class ClientsScreen extends StatefulWidget {
 
 class _ClientsScreenState extends State<ClientsScreen> {
   List<Client> _clients = [];
+  Map<String, String> _photos = {};
   String _query = '';
   bool _loading = true;
   String? _error;
@@ -30,9 +35,11 @@ class _ClientsScreenState extends State<ClientsScreen> {
     });
     try {
       final list = await repo.clients();
+      final photos = await repo.photoUrls(list.map((c) => c.photoPath));
       if (!mounted) return;
       setState(() {
         _clients = list;
+        _photos = photos;
         _loading = false;
       });
     } catch (_) {
@@ -69,7 +76,10 @@ class _ClientsScreenState extends State<ClientsScreen> {
       isScrollControlled: true,
       useSafeArea: true,
       showDragHandle: true,
-      builder: (_) => _ClientSheet(client: c),
+      builder: (_) => _ClientSheet(
+        client: c,
+        photoUrl: c?.photoPath == null ? null : _photos[c!.photoPath],
+      ),
     );
     if (saved == true) _load();
   }
@@ -126,13 +136,25 @@ class _ClientsScreenState extends State<ClientsScreen> {
                                   'retorno a cada ${c.intervalDays} dias',
                                 ].join(' · ');
                                 return ListTile(
-                                  leading: Icon(
-                                    c.isRegular
-                                        ? Icons.star
-                                        : Icons.person_outline,
-                                    color: c.isRegular ? Colors.amber : null,
+                                  leading: ClientAvatar(
+                                    name: c.name,
+                                    photoUrl: c.photoPath == null
+                                        ? null
+                                        : _photos[c.photoPath],
                                   ),
-                                  title: Text(c.name),
+                                  title: Row(
+                                    children: [
+                                      Flexible(
+                                        child: Text(c.name,
+                                            overflow: TextOverflow.ellipsis),
+                                      ),
+                                      if (c.isRegular) ...[
+                                        const SizedBox(width: 4),
+                                        const Icon(Icons.star,
+                                            size: 16, color: Colors.amber),
+                                      ],
+                                    ],
+                                  ),
                                   subtitle: Text(details),
                                   onTap: () => _edit(c),
                                   trailing: _waNumber(c.phone) == null
@@ -155,7 +177,8 @@ class _ClientsScreenState extends State<ClientsScreen> {
 
 class _ClientSheet extends StatefulWidget {
   final Client? client;
-  const _ClientSheet({this.client});
+  final String? photoUrl;
+  const _ClientSheet({this.client, this.photoUrl});
 
   @override
   State<_ClientSheet> createState() => _ClientSheetState();
@@ -170,6 +193,14 @@ class _ClientSheetState extends State<_ClientSheet> {
   bool _saving = false;
   String? _error;
 
+  // foto
+  Uint8List? _newPhoto;
+  String _newPhotoMime = 'image/jpeg';
+  bool _removePhoto = false;
+
+  bool get _hasPhoto =>
+      _newPhoto != null || (!_removePhoto && widget.photoUrl != null);
+
   static const _intervals = [14, 21, 28, 35, 42];
 
   @override
@@ -178,6 +209,67 @@ class _ClientSheetState extends State<_ClientSheet> {
     _phone.dispose();
     _notes.dispose();
     super.dispose();
+  }
+
+  Future<void> _pickPhoto() async {
+    final choice = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('Tirar foto'),
+              onTap: () => Navigator.pop(ctx, 'camera'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Escolher da galeria'),
+              onTap: () => Navigator.pop(ctx, 'gallery'),
+            ),
+            if (_hasPhoto)
+              ListTile(
+                leading: const Icon(Icons.delete_outline),
+                title: const Text('Remover foto'),
+                onTap: () => Navigator.pop(ctx, 'remove'),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    if (choice == 'remove') {
+      setState(() {
+        _newPhoto = null;
+        _removePhoto = true;
+      });
+      return;
+    }
+    try {
+      final file = await ImagePicker().pickImage(
+        source: choice == 'camera' ? ImageSource.camera : ImageSource.gallery,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 80,
+      );
+      if (file == null) return;
+      final bytes = await file.readAsBytes();
+      final mime = file.mimeType ?? 'image/jpeg';
+      if (!mounted) return;
+      setState(() {
+        _newPhoto = bytes;
+        _newPhotoMime = ['image/png', 'image/webp'].contains(mime)
+            ? mime
+            : 'image/jpeg';
+        _removePhoto = false;
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _error = 'Não foi possível abrir a câmera ou a galeria.');
+      }
+    }
   }
 
   Future<void> _save() async {
@@ -191,7 +283,7 @@ class _ClientSheetState extends State<_ClientSheet> {
       _error = null;
     });
     try {
-      await repo.saveClient(
+      final id = await repo.saveClient(
         id: widget.client?.id,
         name: name,
         phone: _phone.text.trim(),
@@ -199,6 +291,23 @@ class _ClientSheetState extends State<_ClientSheet> {
         isRegular: _regular,
         notes: _notes.text.trim(),
       );
+      final oldPath = widget.client?.photoPath;
+      try {
+        if (_newPhoto != null) {
+          await repo.setClientPhoto(id, _newPhoto!,
+              mimeType: _newPhotoMime, oldPath: oldPath);
+        } else if (_removePhoto && oldPath != null) {
+          await repo.removeClientPhoto(id, oldPath);
+        }
+      } catch (_) {
+        if (mounted) {
+          setState(() {
+            _saving = false;
+            _error = 'Os dados foram salvos, mas a foto não. Tente de novo.';
+          });
+        }
+        return;
+      }
       if (mounted) Navigator.pop(context, true);
     } catch (_) {
       if (mounted) {
@@ -228,6 +337,46 @@ class _ClientSheetState extends State<_ClientSheet> {
             Text(widget.client == null ? 'Nova cliente' : 'Editar cliente',
                 style: theme.textTheme.titleLarge),
             const SizedBox(height: 16),
+            Center(
+              child: InkWell(
+                customBorder: const CircleBorder(),
+                onTap: _saving ? null : _pickPhoto,
+                child: Stack(
+                  children: [
+                    ValueListenableBuilder<TextEditingValue>(
+                      valueListenable: _name,
+                      builder: (_, v, __) => ClientAvatar(
+                        name: v.text,
+                        radius: 44,
+                        image: _newPhoto != null ? MemoryImage(_newPhoto!) : null,
+                        photoUrl: _removePhoto ? null : widget.photoUrl,
+                      ),
+                    ),
+                    Positioned(
+                      right: 0,
+                      bottom: 0,
+                      child: CircleAvatar(
+                        radius: 15,
+                        backgroundColor: theme.colorScheme.primary,
+                        child: Icon(
+                          _hasPhoto ? Icons.edit : Icons.photo_camera,
+                          size: 16,
+                          color: theme.colorScheme.onPrimary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Center(
+              child: TextButton(
+                onPressed: _saving ? null : _pickPhoto,
+                child: Text(_hasPhoto ? 'Trocar foto' : 'Adicionar foto'),
+              ),
+            ),
+            const SizedBox(height: 8),
             TextField(
               controller: _name,
               textCapitalization: TextCapitalization.words,
