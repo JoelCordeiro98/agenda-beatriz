@@ -13,6 +13,7 @@ import '../util/whatsapp.dart';
 import '../widgets/finish_sheet.dart';
 import '../widgets/client_avatar.dart';
 import '../widgets/new_appointment_sheet.dart';
+import 'broadcast_screen.dart';
 import 'client_detail_screen.dart';
 import 'overdue_screen.dart';
 import 'reminders_screen.dart';
@@ -589,7 +590,7 @@ class _AgendaScreenState extends State<AgendaScreen> {
     if (!mounted) return;
 
     final controller = TextEditingController(text: text);
-    await showDialog<void>(
+    final choice = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Horários livres'),
@@ -608,9 +609,9 @@ class _AgendaScreenState extends State<AgendaScreen> {
               _snack('Texto copiado');
             },
           ),
-          FilledButton.icon(
-            icon: const Icon(Icons.send),
-            label: const Text('WhatsApp'),
+          TextButton.icon(
+            icon: const Icon(Icons.chat_outlined),
+            label: const Text('Outro contato'),
             onPressed: () async {
               final uri = Uri.parse(
                   'https://wa.me/?text=${Uri.encodeComponent(controller.text)}');
@@ -620,10 +621,24 @@ class _AgendaScreenState extends State<AgendaScreen> {
               if (ctx.mounted) Navigator.pop(ctx);
             },
           ),
+          FilledButton.icon(
+            icon: const Icon(Icons.people_outline),
+            label: const Text('Escolher clientes'),
+            onPressed: () => Navigator.pop(ctx, 'clients'),
+          ),
         ],
       ),
     );
+    final message = controller.text;
     controller.dispose();
+    if (choice == 'clients' && mounted) {
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => BroadcastScreen(
+          message: message,
+          title: 'Enviar horários livres',
+        ),
+      ));
+    }
   }
 
   // ---------------------------------------------------------------- tela
