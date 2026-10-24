@@ -1,0 +1,314 @@
+import 'package:intl/intl.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+import 'models.dart';
+
+/// Todo o acesso ao Supabase fica aqui.
+class Repo {
+  SupabaseClient get db => Supabase.instance.client;
+
+  // Horários padrão: 2 pela manhã e 3 à tarde, de segunda a sábado.
+  static const _defaultTimes = ['08:00', '10:00', '13:00', '15:00', '17:00'];
+
+  Future<List<WorkSlot>> workSlots() async {
+    var rows = await db.from('work_slots').select().order('start_time');
+    if (rows.isEmpty) {
+      // Primeiro uso: cria os horários padrão (depois ela ajusta em Ajustes).
+      await db.from('work_slots').insert([
+        for (var day = 1; day <= 6; day++)
+          for (final t in _defaultTimes) {'weekday': day, 'start_time': t},
+      ]);
+      rows = await db.from('work_slots').select().order('start_time');
+    }
+    return rows.map(WorkSlot.fromMap).toList();
+  }
+
+  // Tabela de preços da Beatriz: usada para preencher uma conta nova.
+  static const _defaultServices = [
+    ('Aplicação em gel', 110.0, 150),
+    ('Manutenção', 90.0, 120),
+    ('Banho de gel', 90.0, 90),
+    ('Esmaltação em gel', 50.0, 60),
+    ('Pé e mão normal', 45.0, 90),
+    ('Só mão', 25.0, 45),
+    ('Só pé', 25.0, 45),
+    ('Aplicação de postiça', 30.0, 60),
+    ('Remoção do gel', 30.0, 30),
+    ('Reposição de unha', 10.0, 15),
+    ('Mudança de formato', 10.0, 15),
+    ('Decoração mais elaborada', 10.0, 20),
+  ];
+
+  /// Conta nova (sem nenhum serviço, nem escondido): cadastra a tabela padrão.
+  Future<void> ensureDefaultServices() async {
+    final any = await db.from('services').select('id').limit(1);
+    if (any.isNotEmpty) return;
+    await db.from('services').insert([
+      for (final (name, price, minutes) in _defaultServices)
+        {'name': name, 'default_price': price, 'duration_min': minutes},
+    ]);
+  }
+
+  Future<List<Service>> services() async {
+    final rows =
+        await db.from('services').select().eq('active', true).order('name');
+    return rows.map(Service.fromMap).toList();
+  }
+
+  Future<List<Client>> clients() async {
+    final rows = await db.from('clients').select().order('name');
+    return rows.map(Client.fromMap).toList();
+  }
+
+  Future<Client?> client(String id) async {
+    final row = await db.from('clients').select().eq('id', id).maybeSingle();
+    return row == null ? null : Client.fromMap(row);
+  }
+
+  /// Atendimentos (menos os desmarcados) entre [start] e [end], em horário local.
+  Future<List<Appointment>> appointmentsBetween(
+      DateTime start, DateTime end) async {
+    final rows = await db
+        .from('appointments')
+        .select('*, appointment_services(*)')
+        .gte('starts_at', start.toUtc().toIso8601String())
+        .lt('starts_at', end.toUtc().toIso8601String())
+        .neq('status', ApptStatus.cancelado)
+        .order('starts_at');
+    return rows.map(Appointment.fromMap).toList();
+  }
+
+  /// Cria o agendamento. Se a cliente ainda não existe, cadastra na hora.
+  Future<void> createAppointment({
+    String? clientId,
+    required String clientName,
+    required DateTime startsAt,
+    required List<Service> services,
+    String? notes,
+  }) async {
+    var id = clientId;
+    if (id == null) {
+      final c = await db
+          .from('clients')
+          .insert({'name': clientName})
+          .select()
+          .single();
+      id = c['id'] as String;
+    }
+
+    final appt = await db
+        .from('appointments')
+        .insert({
+          'client_id': id,
+          'client_name': clientName,
+          'starts_at': startsAt.toUtc().toIso8601String(),
+          if (notes != null && notes.isNotEmpty) 'notes': notes,
+        })
+        .select()
+        .single();
+
+    if (services.isNotEmpty) {
+      await db.from('appointment_services').insert([
+        for (final s in services)
+          {
+            'appointment_id': appt['id'],
+            'service_id': s.id,
+            'service_name': s.name,
+            'price': s.defaultPrice,
+          },
+      ]);
+    }
+  }
+
+  Future<void> setStatus(String appointmentId, String status) async {
+    await db
+        .from('appointments')
+        .update({'status': status}).eq('id', appointmentId);
+  }
+
+  /// Lança os valores finais e marca como concluído.
+  /// [prices]: id do procedimento -> valor cobrado.
+  /// [extraPrice]: usado quando o atendimento não tinha serviço escolhido.
+  Future<void> finishAppointment(
+    String appointmentId,
+    Map<String, double> prices, {
+    double? extraPrice,
+  }) async {
+    for (final e in prices.entries) {
+      await db
+          .from('appointment_services')
+          .update({'price': e.value}).eq('id', e.key);
+    }
+    if (extraPrice != null) {
+      await db.from('appointment_services').insert({
+        'appointment_id': appointmentId,
+        'service_name': 'Atendimento',
+        'price': extraPrice,
+      });
+    }
+    await setStatus(appointmentId, ApptStatus.concluido);
+  }
+  // ---------------------------------------------------------------- caixa
+
+  static final _ymd = DateFormat('yyyy-MM-dd');
+
+  /// Resumo do mês (faturamento, despesas e lucro), pela view monthly_summary.
+  Future<MonthSummary> monthSummary(DateTime month) async {
+    final first = DateTime(month.year, month.month, 1);
+    final row = await db
+        .from('monthly_summary')
+        .select()
+        .eq('month', _ymd.format(first))
+        .maybeSingle();
+    return row == null ? const MonthSummary() : MonthSummary.fromMap(row);
+  }
+
+  /// Fechamentos semanais (semana inteira, seg–dom) que tocam o mês.
+  Future<List<WeekRevenue>> weeksOfMonth(DateTime month) async {
+    final from = DateTime(month.year, month.month, 1 - 6);
+    final to = DateTime(month.year, month.month + 1, 0);
+    final rows = await db
+        .from('revenue_by_week')
+        .select()
+        .gte('week_start', _ymd.format(from))
+        .lte('week_start', _ymd.format(to))
+        .order('week_start');
+    return rows.map(WeekRevenue.fromMap).toList();
+  }
+
+  Future<List<Expense>> expensesOfMonth(DateTime month) async {
+    final rows = await db
+        .from('expenses')
+        .select()
+        .gte('spent_on', _ymd.format(DateTime(month.year, month.month, 1)))
+        .lt('spent_on', _ymd.format(DateTime(month.year, month.month + 1, 1)))
+        .order('spent_on', ascending: false);
+    return rows.map(Expense.fromMap).toList();
+  }
+
+  /// Último valor lançado numa categoria (para sugerir o aluguel).
+  Future<double?> lastExpenseAmount(String category) async {
+    final row = await db
+        .from('expenses')
+        .select('amount')
+        .eq('category', category)
+        .order('spent_on', ascending: false)
+        .limit(1)
+        .maybeSingle();
+    final v = row?['amount'];
+    return v is num ? v.toDouble() : null;
+  }
+
+  Future<void> addExpense({
+    required String category,
+    required double amount,
+    required DateTime spentOn,
+    String? description,
+  }) async {
+    await db.from('expenses').insert({
+      'category': category,
+      'amount': amount,
+      'spent_on': _ymd.format(spentOn),
+      if (description != null && description.isNotEmpty)
+        'description': description,
+    });
+  }
+
+  Future<void> deleteExpense(String id) async {
+    await db.from('expenses').delete().eq('id', id);
+  }
+  // ---------------------------------------------------------------- ajustes
+
+  Future<List<Service>> allServices() async {
+    final rows = await db.from('services').select().order('name');
+    return rows.map(Service.fromMap).toList();
+  }
+
+  Future<void> saveService({String? id, required String name, required double price}) async {
+    final data = {'name': name, 'default_price': price};
+    if (id == null) {
+      await db.from('services').insert(data);
+    } else {
+      await db.from('services').update(data).eq('id', id);
+    }
+  }
+
+  Future<void> setServiceActive(String id, bool active) async {
+    await db.from('services').update({'active': active}).eq('id', id);
+  }
+
+  static String _time(int h, int m) =>
+      '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}';
+
+  Future<void> addWorkSlot(int weekday, int hour, int minute) async {
+    await db
+        .from('work_slots')
+        .insert({'weekday': weekday, 'start_time': _time(hour, minute)});
+  }
+
+  Future<void> deleteWorkSlot(String id) async {
+    await db.from('work_slots').delete().eq('id', id);
+  }
+
+  /// Copia os horários de [fromWeekday] para os dias [to], substituindo os deles.
+  Future<void> copyWorkSlots(int fromWeekday, List<WorkSlot> source, List<int> to) async {
+    if (to.isEmpty) return;
+    await db.from('work_slots').delete().inFilter('weekday', to);
+    final rows = [
+      for (final day in to)
+        for (final s in source.where((s) => s.weekday == fromWeekday))
+          {'weekday': day, 'start_time': _time(s.hour, s.minute)},
+    ];
+    if (rows.isNotEmpty) await db.from('work_slots').insert(rows);
+  }
+
+  Future<void> saveClient({
+    String? id,
+    required String name,
+    String? phone,
+    required int intervalDays,
+    required bool isRegular,
+    String? notes,
+  }) async {
+    final data = {
+      'name': name,
+      'phone': (phone == null || phone.isEmpty) ? null : phone,
+      'maintenance_interval_days': intervalDays,
+      'is_regular': isRegular,
+      'notes': (notes == null || notes.isEmpty) ? null : notes,
+    };
+    if (id == null) {
+      await db.from('clients').insert(data);
+    } else {
+      await db.from('clients').update(data).eq('id', id);
+      // mantém o nome igual nos agendamentos dela
+      await db.from('appointments').update({'client_name': name}).eq('client_id', id);
+    }
+  }
+  // ---------------------------------------------------------------- recuperação
+
+  Future<void> setRecoveryWord(String word) async {
+    await db.rpc('set_recovery_word', params: {'word': word});
+  }
+
+  Future<bool> hasRecoveryWord() async {
+    final r = await db.rpc('has_recovery_word');
+    return r == true;
+  }
+
+  /// true = senha trocada; false = e-mail ou palavra não conferem.
+  Future<bool> resetPasswordWithWord({
+    required String email,
+    required String word,
+    required String newPassword,
+  }) async {
+    final r = await db.rpc('reset_password_with_word', params: {
+      'p_email': email,
+      'p_word': word,
+      'p_new_password': newPassword,
+    });
+    return r == true;
+  }
+}
+
+final repo = Repo();
