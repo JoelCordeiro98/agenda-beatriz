@@ -121,6 +121,172 @@ class _ClientDetailScreenState extends State<ClientDetailScreen> {
     if (!ok && mounted) _snack('Não consegui abrir o WhatsApp.');
   }
 
+  // ---------------------------------------------------------------- excluir
+
+  Future<void> _delete() async {
+    final c = _client;
+    if (c == null) return;
+    final count = _history.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.delete_outline),
+        title: Text('Excluir ${c.name}?'),
+        content: Text(count == 0
+            ? 'O cadastro será apagado. Não dá para desfazer.'
+            : 'O cadastro, a foto e o telefone serão apagados. '
+                'Os $count atendimentos continuam na agenda e no caixa com o '
+                'nome dela, para não mudar os totais.\n\n'
+                'Se for um cadastro repetido, prefira "Juntar com outra cliente".'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: Theme.of(ctx).colorScheme.error),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Excluir'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await repo.deleteClient(c);
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.pop(context, true);
+      messenger.showSnackBar(SnackBar(content: Text('${c.name} foi excluída.')));
+    } catch (_) {
+      _snack('Não foi possível excluir. Verifique a internet.');
+    }
+  }
+
+  // ---------------------------------------------------------------- juntar
+
+  static String _digits(String? s) => (s ?? '').replaceAll(RegExp(r'\D'), '');
+
+  static String _norm(String s) => s
+      .toLowerCase()
+      .replaceAll(RegExp('[áàâã]'), 'a')
+      .replaceAll(RegExp('[éê]'), 'e')
+      .replaceAll('í', 'i')
+      .replaceAll(RegExp('[óôõ]'), 'o')
+      .replaceAll('ú', 'u')
+      .replaceAll('ç', 'c')
+      .trim();
+
+  bool _looksLike(Client a, Client b) {
+    final pa = _digits(a.phone), pb = _digits(b.phone);
+    if (pa.length >= 8 && pb.length >= 8 &&
+        pa.substring(pa.length - 8) == pb.substring(pb.length - 8)) {
+      return true;
+    }
+    final na = _norm(a.name), nb = _norm(b.name);
+    if (na.isEmpty || nb.isEmpty) return false;
+    return na == nb ||
+        na.contains(nb) ||
+        nb.contains(na) ||
+        na.split(' ').first == nb.split(' ').first;
+  }
+
+  Future<void> _merge() async {
+    final c = _client;
+    if (c == null) return;
+    List<Client> others;
+    try {
+      others = (await repo.clients()).where((o) => o.id != c.id).toList();
+    } catch (_) {
+      _snack('Sem conexão. Tente de novo.');
+      return;
+    }
+    if (!mounted) return;
+    if (others.isEmpty) {
+      _snack('Não há outra cliente para juntar.');
+      return;
+    }
+    others.sort((a, b) {
+      final la = _looksLike(c, a) ? 0 : 1, lb = _looksLike(c, b) ? 0 : 1;
+      return la != lb ? la - lb : a.name.compareTo(b.name);
+    });
+
+    final other = await showModalBottomSheet<Client>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (_) => _PickClientSheet(
+        clients: others,
+        similar: {for (final o in others) if (_looksLike(c, o)) o.id},
+        title: 'Qual é o outro cadastro de ${firstName(c.name)}?',
+      ),
+    );
+    if (other == null || !mounted) return;
+
+    // Qual dos dois fica?
+    final keep = await showDialog<Client>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Qual cadastro fica?'),
+        children: [
+          for (final k in [c, other])
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, k),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(k.name),
+                subtitle: Text(k.phone ?? 'sem telefone'),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (keep == null || !mounted) return;
+    final drop = keep.id == c.id ? other : c;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: const Icon(Icons.merge_type),
+        title: const Text('Juntar cadastros?'),
+        content: Text(
+            'Os atendimentos de "${drop.name}" passam para "${keep.name}". '
+            'Telefone, foto e observações que faltarem também são aproveitados. '
+            'Depois, "${drop.name}" é apagada.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancelar')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Juntar')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    try {
+      await repo.mergeClients(from: drop, into: keep);
+      if (!mounted) return;
+      _changed = true;
+      if (keep.id == c.id) {
+        _snack('Cadastros juntados.');
+        _load();
+      } else {
+        // a ficha aberta foi apagada: abre a que ficou
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+              builder: (_) => ClientDetailScreen(clientId: keep.id)),
+          result: true,
+        );
+      }
+    } catch (_) {
+      _snack('Não foi possível juntar. Verifique a internet.');
+    }
+  }
+
   void _openPhoto(String url, Appointment a) {
     showDialog<void>(
       context: context,
@@ -159,6 +325,33 @@ class _ClientDetailScreenState extends State<ClientDetailScreen> {
               tooltip: 'Editar',
               icon: const Icon(Icons.edit_outlined),
               onPressed: _client == null ? null : _edit,
+            ),
+            PopupMenuButton<String>(
+              enabled: _client != null,
+              onSelected: (v) {
+                if (v == 'merge') _merge();
+                if (v == 'delete') _delete();
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(
+                  value: 'merge',
+                  child: ListTile(
+                    leading: Icon(Icons.merge_type),
+                    title: Text('Juntar com outra cliente'),
+                    subtitle: Text('Para cadastro duplicado'),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+                PopupMenuItem(
+                  value: 'delete',
+                  child: ListTile(
+                    leading: Icon(Icons.delete_outline, color: Colors.red),
+                    title: Text('Excluir cliente',
+                        style: TextStyle(color: Colors.red)),
+                    contentPadding: EdgeInsets.zero,
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -374,6 +567,82 @@ class _Stat extends StatelessWidget {
               style: theme.textTheme.titleSmall
                   ?.copyWith(fontWeight: FontWeight.bold)),
         ],
+      ),
+    );
+  }
+}
+
+/// Lista para escolher outra cliente (as parecidas aparecem primeiro).
+class _PickClientSheet extends StatefulWidget {
+  final List<Client> clients;
+  final Set<String> similar;
+  final String title;
+  const _PickClientSheet({
+    required this.clients,
+    required this.similar,
+    required this.title,
+  });
+
+  @override
+  State<_PickClientSheet> createState() => _PickClientSheetState();
+}
+
+class _PickClientSheetState extends State<_PickClientSheet> {
+  String _query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _query.trim().toLowerCase();
+    final list = widget.clients
+        .where((c) => q.isEmpty || c.name.toLowerCase().contains(q))
+        .toList();
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.viewInsetsOf(context).bottom),
+      child: SizedBox(
+        height: MediaQuery.sizeOf(context).height * 0.7,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+              child: Text(widget.title,
+                  style: Theme.of(context).textTheme.titleMedium),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: TextField(
+                onChanged: (v) => setState(() => _query = v),
+                decoration: const InputDecoration(
+                  hintText: 'Buscar cliente',
+                  prefixIcon: Icon(Icons.search),
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListView.builder(
+                itemCount: list.length,
+                itemBuilder: (_, i) {
+                  final c = list[i];
+                  final similar = widget.similar.contains(c.id);
+                  return ListTile(
+                    leading: ClientAvatar(name: c.name),
+                    title: Text(c.name),
+                    subtitle: Text(c.phone ?? 'sem telefone'),
+                    trailing: similar
+                        ? const Chip(
+                            label: Text('parecida'),
+                            visualDensity: VisualDensity.compact,
+                          )
+                        : null,
+                    onTap: () => Navigator.pop(context, c),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

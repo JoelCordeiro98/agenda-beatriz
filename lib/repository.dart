@@ -534,6 +534,56 @@ class Repo {
   Future<void> deleteBlock(String id) async {
     await db.from('blocks').delete().eq('id', id);
   }
+  // ---------------------------------------------------------------- excluir / juntar clientes
+
+  /// Apaga o cadastro. Os atendimentos ficam (com o nome dela) para não mexer no caixa.
+  Future<void> deleteClient(Client c) async {
+    await db.from('clients').delete().eq('id', c.id);
+    if (c.photoPath != null) {
+      _photoUrlCache.remove(c.photoPath);
+      try {
+        await db.storage.from(_photoBucket).remove([c.photoPath!]);
+      } catch (_) {}
+    }
+  }
+
+  /// Junta um cadastro duplicado ([from]) no que fica ([into]):
+  /// move os atendimentos, aproveita telefone/foto/observações que faltarem
+  /// e apaga o duplicado.
+  Future<void> mergeClients({required Client from, required Client into}) async {
+    await db
+        .from('appointments')
+        .update({'client_id': into.id, 'client_name': into.name}).eq('client_id', from.id);
+
+    final patch = <String, dynamic>{};
+    if ((into.phone == null || into.phone!.trim().isEmpty) &&
+        from.phone != null &&
+        from.phone!.trim().isNotEmpty) {
+      patch['phone'] = from.phone;
+    }
+    var photoMoved = false;
+    if (into.photoPath == null && from.photoPath != null) {
+      patch['photo_path'] = from.photoPath;
+      photoMoved = true;
+    }
+    if (from.isRegular && !into.isRegular) patch['is_regular'] = true;
+    final fromNotes = from.notes?.trim() ?? '';
+    if (fromNotes.isNotEmpty) {
+      final intoNotes = into.notes?.trim() ?? '';
+      patch['notes'] = intoNotes.isEmpty ? fromNotes : '$intoNotes\n$fromNotes';
+    }
+    if (patch.isNotEmpty) {
+      await db.from('clients').update(patch).eq('id', into.id);
+    }
+
+    await db.from('clients').delete().eq('id', from.id);
+    if (!photoMoved && from.photoPath != null) {
+      _photoUrlCache.remove(from.photoPath);
+      try {
+        await db.storage.from(_photoBucket).remove([from.photoPath!]);
+      } catch (_) {}
+    }
+  }
 }
 
 final repo = Repo();
